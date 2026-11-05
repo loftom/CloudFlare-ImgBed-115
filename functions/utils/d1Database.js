@@ -195,6 +195,80 @@ D1Database.prototype.countExpiredFiles = function(now) {
     });
 };
 
+/**
+ * 管理端目录分页。
+ * 只按目录前缀、LIMIT/OFFSET 读取当前页，避免把整张 files 表拉进 Worker。
+ * 根目录文件的 directory 列是 NULL：写入时空字符串会被存成 NULL。
+ * count 为 -1 时返回该目录下的全部直接文件（或 recursive 时的全部文件）。
+ * countOnly 只统计，供 sum=true 使用。
+ */
+D1Database.prototype.queryDirectoryListing = function(options) {
+    options = options || {};
+    var directory = normalizeListingDirectory(options.directory);
+    var start = Math.max(0, parseInt(options.start, 10) || 0);
+    var countValue = options.count == null ? 50 : Number(options.count);
+    var unlimited = countValue === -1;
+    var limit = unlimited ? 0 : (Number.isFinite(countValue) ? Math.max(0, countValue) : 50);
+    var recursive = !!options.recursive;
+    var search = options.search ? String(options.search).trim() : '';
+    var countOnly = !!options.countOnly;
+
+    var scope = listingFilter(
+        directory ? "directory LIKE ? ESCAPE '\\'" : '1 = 1',
+        directory ? [escapeLikePattern(directory) + '%'] : [],
+        search
+    );
+    var directExpr = directory ? 'directory = ?' : "(directory IS NULL OR directory = '')";
+    var countSql = 'SELECT COUNT(*) AS totalCount, COALESCE(SUM(CASE WHEN ' + directExpr +
+        ' THEN 1 ELSE 0 END), 0) AS directFileCount FROM files WHERE ' + scope.sql;
+    var countParams = (directory ? [directory] : []).concat(scope.params);
+    var countStmt = this.db.prepare(countSql);
+    if (countParams.length > 0) {
+        countStmt = countStmt.bind.apply(countStmt, countParams);
+    }
+
+    var self = this;
+    return countStmt.first().then(function(countRow) {
+        var totalCount = countRow ? Number(countRow.totalCount) || 0 : 0;
+        var directFileCount = countRow ? Number(countRow.directFileCount) || 0 : 0;
+        if (countOnly) {
+            return {
+                files: [],
+                directories: [],
+                totalCount: totalCount,
+                directFileCount: directFileCount,
+                directFolderCount: 0,
+                returnedCount: 0
+            };
+        }
+
+        return Promise.all([
+            runStatement(self.db, buildChildDirectoryQuery(directory, search)),
+            runStatement(self.db, buildDirectoryFileQuery(directory, search, recursive, unlimited, limit, start))
+        ]).then(function(results) {
+            var directories = (results[0].results || []).map(function(row) {
+                return row.child;
+            }).filter(function(name) {
+                return !!name;
+            });
+            var files = (results[1].results || []).map(function(row) {
+                return {
+                    id: row.id,
+                    metadata: parseMetadata(row.metadata)
+                };
+            });
+            return {
+                files: files,
+                directories: directories,
+                totalCount: totalCount,
+                directFileCount: directFileCount,
+                directFolderCount: directories.length,
+                returnedCount: files.length
+            };
+        });
+    });
+};
+
 // ==================== 设置操作 ====================
 
 /**
@@ -480,6 +554,108 @@ D1Database.prototype.list = function(options) {
         return this.listFiles(options);
     }
 };
+
+function escapeLikePattern(value) {
+    return String(value).replace(/[\\%_]/g, function(ch) { return '\\' + ch; });
+}
+
+function normalizeListingDirectory(directory) {
+    directory = String(directory || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    if (directory && !directory.endsWith('/')) {
+        directory += '/';
+    }
+    return directory;
+}
+
+function listingFilter(extraSql, extraParams, search) {
+    var sql = "timestamp IS NOT NULL AND id NOT GLOB 'chunk_*' AND (" + extraSql + ')';
+    var params = extraParams.slice();
+    if (search) {
+        sql += " AND (instr(lower(id), ?) > 0 OR instr(lower(ifnull(file_name, '')), ?) > 0)";
+        var needle = String(search).toLowerCase();
+        params.push(needle, needle);
+    }
+    return { sql: sql, params: params };
+}
+
+function buildChildDirectoryQuery(directory, search) {
+    var selectParams = [];
+    var childExpr;
+    var where = ["timestamp IS NOT NULL", "id NOT GLOB 'chunk_*'"];
+    var whereParams = [];
+
+    if (directory) {
+        // 直接子目录：去掉当前前缀后的第一段，结果不带结尾斜杠（与索引列表一致）
+        childExpr = "substr(directory, 1, ? + instr(substr(directory, ?), '/') - 1)";
+        selectParams.push(directory.length, directory.length + 1);
+        where.push("directory LIKE ? ESCAPE '\\'");
+        whereParams.push(escapeLikePattern(directory) + '%');
+        where.push("instr(substr(directory, ?), '/') > 0");
+        whereParams.push(directory.length + 1);
+    } else {
+        childExpr = "substr(directory, 1, instr(directory, '/') - 1)";
+        where.push("directory IS NOT NULL AND instr(directory, '/') > 0");
+    }
+
+    if (search) {
+        where.push("(instr(lower(id), ?) > 0 OR instr(lower(ifnull(file_name, '')), ?) > 0)");
+        var needle = String(search).toLowerCase();
+        whereParams.push(needle, needle);
+    }
+
+    return {
+        sql: 'SELECT DISTINCT ' + childExpr + ' AS child FROM files WHERE ' + where.join(' AND ') + ' ORDER BY child',
+        params: selectParams.concat(whereParams)
+    };
+}
+
+function buildDirectoryFileQuery(directory, search, recursive, unlimited, limit, start) {
+    var filter;
+    var sql;
+
+    if (!recursive && !directory) {
+        // 两段等值查找才能用 idx_files_directory。OR 会让根目录分页退化为整表扫描。
+        var nullRows = listingFilter('directory IS NULL', [], search);
+        var emptyRows = listingFilter("directory = ''", [], search);
+        sql = 'SELECT id, metadata FROM (' +
+            'SELECT id, metadata, timestamp FROM files WHERE ' + nullRows.sql +
+            ' UNION ALL SELECT id, metadata, timestamp FROM files WHERE ' + emptyRows.sql +
+            ') ORDER BY timestamp DESC, id ASC';
+        filter = { params: nullRows.params.concat(emptyRows.params) };
+    } else if (!recursive) {
+        filter = listingFilter('directory = ?', [directory], search);
+        sql = 'SELECT id, metadata FROM files WHERE ' + filter.sql + ' ORDER BY timestamp DESC, id ASC';
+    } else if (directory) {
+        filter = listingFilter("directory LIKE ? ESCAPE '\\'", [escapeLikePattern(directory) + '%'], search);
+        sql = 'SELECT id, metadata FROM files WHERE ' + filter.sql + ' ORDER BY timestamp DESC, id ASC';
+    } else {
+        filter = listingFilter('1 = 1', [], search);
+        sql = 'SELECT id, metadata FROM files WHERE ' + filter.sql + ' ORDER BY timestamp DESC, id ASC';
+    }
+
+    var params = filter.params.slice();
+    if (!unlimited) {
+        sql += ' LIMIT ? OFFSET ?';
+        params.push(limit, start);
+    }
+    return { sql: sql, params: params };
+}
+
+function runStatement(db, query) {
+    var stmt = db.prepare(query.sql);
+    if (query.params.length > 0) {
+        stmt = stmt.bind.apply(stmt, query.params);
+    }
+    return stmt.all();
+}
+
+function parseMetadata(value) {
+    try {
+        return JSON.parse(value || '{}');
+    } catch (error) {
+        return {};
+    }
+}
 
 // 导出构造函数
 export { D1Database };
