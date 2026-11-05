@@ -135,9 +135,14 @@ export async function onRequest(context) {
                 countOnly: true
             });
 
+            // countOnly 成功时没有 success 字段；只有读取失败才是 success === false
+            const total = result.success === false
+                ? await countFilesWithoutIndex(context, { dir, search })
+                : result.totalCount;
+
             return new Response(JSON.stringify({
-                sum: result.totalCount,
-                indexLastUpdated: result.indexLastUpdated
+                sum: total,
+                indexLastUpdated: result.success === false ? Date.now() : result.indexLastUpdated
             }), {
                 headers: { "Content-Type": "application/json", ...corsHeaders }
             });
@@ -160,9 +165,15 @@ export async function onRequest(context) {
             includeSubdirFiles: recursive,
         });
 
-        // 索引读取失败，直接从 KV 中获取所有文件记录
+        // 索引不可用时按目录直接查询，只取当前页
         if (!result.success) {
-            const dbRecords = await getAllFileRecords(context.env, dir);
+            const dbRecords = await listFilesWithoutIndex(context, {
+                dir,
+                start,
+                count,
+                recursive,
+                search,
+            });
 
             return new Response(JSON.stringify({
                 files: dbRecords.files,
@@ -172,7 +183,7 @@ export async function onRequest(context) {
                 directFolderCount: dbRecords.directFolderCount,
                 returnedCount: dbRecords.returnedCount,
                 indexLastUpdated: Date.now(),
-                isIndexedResponse: false // 标记这是来自 KV 的响应
+                isIndexedResponse: false // 标记这是未走索引的响应
             }), {
                 headers: { "Content-Type": "application/json", ...corsHeaders }
             });
@@ -211,14 +222,50 @@ export async function onRequest(context) {
     }
 }
 
-async function getAllFileRecords(env, dir) {
+async function countFilesWithoutIndex(context, { dir, search }) {
+    const listed = await queryFileListing(context, {
+        dir,
+        search,
+        start: 0,
+        count: -1,
+        recursive: true,
+        countOnly: true,
+    });
+    return listed.totalCount;
+}
+
+async function listFilesWithoutIndex(context, options) {
+    const db = getDatabase(context.env);
+    const listed = await queryFileListing(context, options);
+    const metadataViewContext = await createMetadataViewContext(db, context.env);
+    const files = await Promise.all(listed.files.map(file =>
+        serializeFileRecordForManagement(db, context.env, file, metadataViewContext)
+    ));
+    return { ...listed, files };
+}
+
+async function queryFileListing(context, { dir, start, count, recursive, search, countOnly = false }) {
+    const db = getDatabase(context.env);
+    if (typeof db.queryDirectoryListing === 'function') {
+        return db.queryDirectoryListing({
+            directory: dir,
+            start,
+            count,
+            recursive,
+            search,
+            countOnly,
+        });
+    }
+    return scanFileRecords(db, dir, { start, count, recursive, search, countOnly });
+}
+
+// KV 没有目录列，只能按键前缀扫描。D1 走 queryDirectoryListing，不会进这里。
+async function scanFileRecords(db, dir, { start = 0, count = -1, recursive = false, search = '', countOnly = false }) {
     const allRecords = [];
     let cursor = null;
+    const needle = search ? search.toLowerCase() : '';
 
     try {
-        const db = getDatabase(env);
-        const metadataViewContext = await createMetadataViewContext(db, env);
-
         while (true) {
             const response = await db.list({
                 prefix: dir,
@@ -226,7 +273,6 @@ async function getAllFileRecords(env, dir) {
                 cursor: cursor
             });
 
-            // 检查响应格式
             if (!response || !response.keys || !Array.isArray(response.keys)) {
                 console.error('Invalid response from database list:', response);
                 break;
@@ -235,49 +281,56 @@ async function getAllFileRecords(env, dir) {
             cursor = response.cursor;
 
             for (const item of response.keys) {
-                // 跳过管理相关的键
                 if (item.name.startsWith('manage@') || item.name.startsWith('chunk_')) {
                     continue;
                 }
-
-                // 跳过没有元数据的文件
                 if (!item.metadata || !item.metadata.TimeStamp) {
                     continue;
                 }
-
-                allRecords.push(await serializeFileRecordForManagement(db, env, item, metadataViewContext));
+                if (needle) {
+                    const fileName = item.metadata.FileName || '';
+                    if (!item.name.toLowerCase().includes(needle) && !fileName.toLowerCase().includes(needle)) {
+                        continue;
+                    }
+                }
+                allRecords.push({ id: item.name, metadata: item.metadata });
             }
 
             if (!cursor) break;
-
-            // 添加协作点
             await new Promise(resolve => setTimeout(resolve, 10));
         }
 
-        // 提取目录信息
         const directories = new Set();
-        const filteredRecords = [];
+        const directRecords = [];
         allRecords.forEach(item => {
-            const subDir = item.name.substring(dir.length);
+            const subDir = item.id.substring(dir.length);
             const firstSlashIndex = subDir.indexOf('/');
             if (firstSlashIndex !== -1) {
                 directories.add(dir + subDir.substring(0, firstSlashIndex));
             } else {
-                filteredRecords.push(item);
+                directRecords.push(item);
             }
         });
 
+        let resultFiles = recursive ? allRecords : directRecords;
+        if (!countOnly && count !== -1) {
+            const startIndex = Math.max(0, start);
+            resultFiles = resultFiles.slice(startIndex, startIndex + Math.max(0, count));
+        }
+        if (countOnly) {
+            resultFiles = [];
+        }
+
         return {
-            files: filteredRecords,
+            files: resultFiles,
             directories: Array.from(directories),
             totalCount: allRecords.length,
-            directFileCount: filteredRecords.length,
+            directFileCount: directRecords.length,
             directFolderCount: directories.size,
-            returnedCount: filteredRecords.length
+            returnedCount: resultFiles.length
         };
-
     } catch (error) {
-        console.error('Error in getAllFileRecords:', error);
+        console.error('Error in scanFileRecords:', error);
         return {
             files: [],
             directories: [],

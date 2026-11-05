@@ -48,6 +48,9 @@ const INDEX_CHUNK_SIZE_D1 = 500; // D1 数据库分块大小
 const INDEX_CHUNK_SIZE_KV = 5000; // KV 存储分块大小
 const KV_LIST_LIMIT = 1000; // 数据库列出批量大小
 const BATCH_SIZE = 10; // 批量处理大小
+// 全量读入 isolate 的上限。再大就要按分块逐个解析整份目录，会顶满 Worker 内存，
+// 分块数本身也会打满子请求上限。超过后列表改走数据库分页，而不是再整库重建。
+export const MAX_IN_MEMORY_INDEX_FILES = 100000;
 
 /**
  * 根据数据库类型获取索引分块大小
@@ -312,10 +315,10 @@ export async function mergeOperationsToIndex(context, options = {}) {
         // 获取当前索引
         const currentIndex = await getIndex(context);
         if (currentIndex.success === false) {
-            console.error('Failed to get current index for merge');
             return {
                 success: false,
-                error: 'Failed to get current index'
+                error: 'Failed to get current index',
+                index: currentIndex
             };
         }
 
@@ -330,7 +333,8 @@ export async function mergeOperationsToIndex(context, options = {}) {
             return {
                 success: true,
                 processedOperations: 0,
-                message: 'No pending operations'
+                message: 'No pending operations',
+                index: currentIndex
             };
         }
 
@@ -442,7 +446,8 @@ export async function mergeOperationsToIndex(context, options = {}) {
 
             return {
                 success: false,
-                error: 'There are remaining operations, will process them in subsequent calls.'
+                error: 'There are remaining operations, will process them in subsequent calls.',
+                index: workingIndex
             };
         }
 
@@ -453,7 +458,8 @@ export async function mergeOperationsToIndex(context, options = {}) {
             updatedCount,
             removedCount,
             movedCount,
-            totalFiles: workingIndex.totalCount
+            totalFiles: workingIndex.totalCount,
+            index: workingIndex
         };
 
         console.log('Operations merge completed:', result);
@@ -517,15 +523,14 @@ export async function readIndex(context, options = {}) {
         // 处理目录满足无头有尾的格式，根目录为空
         const dirPrefix = directory === '' || directory.endsWith('/') ? directory : directory + '/';
 
-        // 处理挂起的操作
+        // 合并时已经读过索引。这里直接复用，避免再把全部分块读一遍。
         const mergeResult = await mergeOperationsToIndex(context);
         if (!mergeResult.success) {
             throw new Error('Failed to merge operations: ' + mergeResult.error);
         }
 
-        // 获取当前索引
-        const index = await getIndex(context);
-        if (!index.success) {
+        const index = mergeResult.index;
+        if (!index || index.success === false) {
             throw new Error('Failed to get index');
         }
 
@@ -735,7 +740,12 @@ export async function readIndex(context, options = {}) {
         };
 
     } catch (error) {
-        console.error('Error reading index:', error);
+        // 索引本来就不可用时，列表会改走数据库分页，不需要每次都打一整段堆栈
+        if (String(error?.message || '').includes('Failed to get current index')) {
+            console.warn('Index is not available for this list');
+        } else {
+            console.error('Error reading index:', error);
+        }
         return {
             files: [],
             directories: [],
@@ -1658,19 +1668,18 @@ export async function deleteAllOperations(context) {
  * @param {Object} context - 上下文对象
  */
 async function getIndex(context) {
-    const { waitUntil } = context;
     try {
         // 首先尝试加载分块索引
         const index = await loadChunkedIndex(context);
         if (index.success) {
             return index;
-        } else {
-            // 如果加载失败，触发重建索引
-            waitUntil(rebuildIndex(context));
         }
+        // 读取失败不再自动重建。全量重建会把整库载入内存，数据量上来之后每次都会失败，
+        // 而列表请求再 waitUntil 一次会把这些失败的重建叠在一起。
+        // 需要重建时仍由 /api/manage/list?action=rebuild 显式触发。
+        console.warn('Index is unavailable; not scheduling a rebuild');
     } catch (error) {
-        console.warn('Error reading index, creating new one:', error);
-        waitUntil(rebuildIndex(context));
+        console.warn('Error reading index; not scheduling a rebuild:', error);
     }
     
     // 返回空的索引结构
@@ -1916,15 +1925,15 @@ async function saveChunkedIndex(context, index) {
             chunkSize: chunkSize
         };
         
-        await db.put(INDEX_META_KEY, JSON.stringify(metadata));
-        
-        // 保存各个分块
+        // 先写分块，再发布 meta。meta 若先指向还不存在的分块，读取会把缺块当成空目录。
+        // 分块写入失败时保留原来的 meta，列表可以继续用上一份完整索引。
         const savePromises = chunks.map((chunk, chunkId) => {
             const chunkKey = `${INDEX_KEY}_${chunkId}`;
             return db.put(chunkKey, JSON.stringify(chunk));
         });
-        
+
         await Promise.all(savePromises);
+        await db.put(INDEX_META_KEY, JSON.stringify(metadata));
         
         console.log(`Saved chunked index: ${chunks.length} chunks, ${files.length} total files, ${totalSizeMB.toFixed(2)} MB`);
         return true;
@@ -1952,18 +1961,36 @@ async function loadChunkedIndex(context) {
         }
         
         const metadata = JSON.parse(metadataStr);
+        const chunkCount = Number(metadata.chunkCount) || 0;
+        const chunkSize = Number(metadata.chunkSize) || getIndexChunkSize(env);
+        const estimatedFiles = chunkCount * chunkSize;
+        if (!Number.isFinite(estimatedFiles) || estimatedFiles > MAX_IN_MEMORY_INDEX_FILES) {
+            console.warn(`Index has ${chunkCount} chunks (~${estimatedFiles} files); refusing to load it into memory`);
+            return {
+                files: [],
+                lastUpdated: metadata.lastUpdated || Date.now(),
+                totalCount: metadata.totalCount || 0,
+                lastOperationId: metadata.lastOperationId || null,
+                success: false,
+            };
+        }
+
         const files = [];
         
-        // 并行加载所有分块
+        // 并行加载所有分块。缺块必须失败：当成空数组会让残缺索引看起来是完整的。
         const loadPromises = [];
-        for (let chunkId = 0; chunkId < metadata.chunkCount; chunkId++) {
+        for (let chunkId = 0; chunkId < chunkCount; chunkId++) {
             const chunkKey = `${INDEX_KEY}_${chunkId}`;
             loadPromises.push(
                 db.get(chunkKey).then(chunkStr => {
-                    if (chunkStr) {
-                        return JSON.parse(chunkStr);
+                    if (chunkStr == null || chunkStr === '') {
+                        throw new Error(`Index chunk missing: ${chunkKey}`);
                     }
-                    return [];
+                    const parsed = JSON.parse(chunkStr);
+                    if (!Array.isArray(parsed)) {
+                        throw new Error(`Index chunk invalid: ${chunkKey}`);
+                    }
+                    return parsed;
                 })
             );
         }
@@ -1985,7 +2012,7 @@ async function loadChunkedIndex(context) {
             success: true
         };
         
-        console.log(`Loaded chunked index: ${metadata.chunkCount} chunks, ${files.length} total files`);
+        console.log(`Loaded chunked index: ${chunkCount} chunks, ${files.length} total files`);
         return index;
         
     } catch (error) {
@@ -2150,11 +2177,11 @@ export async function getIndexStorageStats(context) {
  * @returns {Object} 树形结构 { name, path, children }
  */
 export async function getDirectoryTree(context) {
-    // 1. 合并挂起操作
-    await mergeOperationsToIndex(context);
-
-    // 2. 获取索引
-    const index = await getIndex(context);
+    // 合并时已经读过索引，直接复用，不再整份重读
+    const mergeResult = await mergeOperationsToIndex(context);
+    const index = mergeResult.index && mergeResult.index.success !== false
+        ? mergeResult.index
+        : { files: [] };
 
     // 3. 提取所有目录路径
     const directorySet = new Set();
