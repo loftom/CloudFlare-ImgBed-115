@@ -196,13 +196,58 @@ D1Database.prototype.countExpiredFiles = function(now) {
 };
 
 /**
- * 管理端目录分页。
- * 只按目录前缀、LIMIT/OFFSET 读取当前页，避免把整张 files 表拉进 Worker。
- * 根目录文件的 directory 列是 NULL：写入时空字符串会被存成 NULL。
- * count 为 -1 时返回该目录下的全部直接文件（或 recursive 时的全部文件）。
- * countOnly 只统计，供 sum=true 使用。
+ * files 里可被列表看到的行是否已经超过 offset。
+ * offset 用分块索引 meta 声称的数量（生产上是一万多，不是整库一百万）。
+ * 多出来就说明分块索引不能代表目录，调用方不应再读或合并分块。
+ * 结果记在 D1 绑定上：确认超出后保留 10 分钟，确认没有超出只保留 20 秒，
+ * 这样新上传很快会改走 SQL，而百万行目录不会每个请求都再探一次。
  */
-D1Database.prototype.queryDirectoryListing = function(options) {
+D1Database.prototype.catalogHasMoreThan = function(count) {
+    var offset = Math.max(0, parseInt(count, 10) || 0);
+    var now = Date.now();
+    var bucket = cacheBucket(catalogProbeCache, this.db);
+    var cachedOffsets = Array.from(bucket.keys());
+    for (var i = 0; i < cachedOffsets.length; i++) {
+        var cachedOffset = cachedOffsets[i];
+        var entry = bucket.get(cachedOffset);
+        if (!entry || now > entry.expires) {
+            bucket.delete(cachedOffset);
+            continue;
+        }
+        if (entry.more && offset <= cachedOffset) {
+            return Promise.resolve(true);
+        }
+        if (!entry.more && offset >= cachedOffset) {
+            return Promise.resolve(false);
+        }
+    }
+
+    var stmt = this.db.prepare(
+        "SELECT 1 AS present FROM files WHERE timestamp IS NOT NULL AND id NOT GLOB 'chunk_*' LIMIT 1 OFFSET ?"
+    );
+    return stmt.bind(offset).first().then(function(row) {
+        var more = !!(row && row.present != null);
+        bucket.set(offset, {
+            more: more,
+            expires: now + (more ? CATALOG_PROBE_MORE_TTL_MS : CATALOG_PROBE_FRESH_TTL_MS)
+        });
+        return more;
+    }).catch(function() {
+        // 探测失败时当作目录已经超出索引，避免再去合并分块。
+        return true;
+    });
+};
+
+/**
+ * 管理端目录分页。
+ * 非递归页只按 directory = ? 走 idx_files_directory_timestamp，取 LIMIT 行，不再把整个目录的 metadata 放进临时排序。
+ * 根目录文件的 directory 列是 NULL，另外兼容历史上写成空字符串的行；两段等值查找后在 Worker 里按时间合并。
+ * 子目录用前缀跳查，不把目录下每个文件都扫一遍。计数是索引范围上的 COUNT，并在同一个 D1 绑定上缓存约 20 秒。
+ * count 为 -1 时仍返回该目录下的全部直接文件（或 recursive 时的全部文件），文件夹删除/移动依赖这一点。
+ * countOnly 只统计，供 sum=true 使用。
+ * 计数若因 D1 过载失败，已经取到的这一页仍然返回，countsUnavailable 为 true，数字只是下界。
+ */
+D1Database.prototype.queryDirectoryListing = async function(options) {
     options = options || {};
     var directory = normalizeListingDirectory(options.directory);
     var start = Math.max(0, parseInt(options.start, 10) || 0);
@@ -213,60 +258,50 @@ D1Database.prototype.queryDirectoryListing = function(options) {
     var search = options.search ? String(options.search).trim() : '';
     var countOnly = !!options.countOnly;
 
-    var scope = listingFilter(
-        directory ? "directory LIKE ? ESCAPE '\\'" : '1 = 1',
-        directory ? [escapeLikePattern(directory) + '%'] : [],
-        search
-    );
-    var directExpr = directory ? 'directory = ?' : "(directory IS NULL OR directory = '')";
-    var countSql = 'SELECT COUNT(*) AS totalCount, COALESCE(SUM(CASE WHEN ' + directExpr +
-        ' THEN 1 ELSE 0 END), 0) AS directFileCount FROM files WHERE ' + scope.sql;
-    var countParams = (directory ? [directory] : []).concat(scope.params);
-    var countStmt = this.db.prepare(countSql);
-    if (countParams.length > 0) {
-        countStmt = countStmt.bind.apply(countStmt, countParams);
+    if (countOnly) {
+        var onlyCounts = await readListingCounts(this.db, directory, search);
+        // sum=true 只有一个数字。计数被拒绝时不能把下界当成全库总数。
+        if (onlyCounts.countsUnavailable) {
+            throw new Error('D1 DB is overloaded');
+        }
+        return {
+            files: [],
+            directories: [],
+            totalCount: onlyCounts.totalCount,
+            directFileCount: onlyCounts.directFileCount,
+            directFolderCount: 0,
+            returnedCount: 0
+        };
     }
 
-    var self = this;
-    return countStmt.first().then(function(countRow) {
-        var totalCount = countRow ? Number(countRow.totalCount) || 0 : 0;
-        var directFileCount = countRow ? Number(countRow.directFileCount) || 0 : 0;
-        if (countOnly) {
-            return {
-                files: [],
-                directories: [],
-                totalCount: totalCount,
-                directFileCount: directFileCount,
-                directFolderCount: 0,
-                returnedCount: 0
-            };
+    // 先取当前页和子目录。这两条走索引，应在计数之前完成，避免和全库 COUNT 抢同一段 D1 时间。
+    var files = await listDirectoryFiles(this.db, directory, search, recursive, unlimited, limit, start);
+    var directories = await listChildDirectories(this.db, directory, search);
+    var counts;
+    try {
+        counts = await readListingCounts(this.db, directory, search);
+    } catch (error) {
+        if (!isDatabaseOverload(error)) {
+            throw error;
         }
+        counts = lowerBoundCounts(files, start, limit, unlimited);
+    }
 
-        return Promise.all([
-            runStatement(self.db, buildChildDirectoryQuery(directory, search)),
-            runStatement(self.db, buildDirectoryFileQuery(directory, search, recursive, unlimited, limit, start))
-        ]).then(function(results) {
-            var directories = (results[0].results || []).map(function(row) {
-                return row.child;
-            }).filter(function(name) {
-                return !!name;
-            });
-            var files = (results[1].results || []).map(function(row) {
-                return {
-                    id: row.id,
-                    metadata: parseMetadata(row.metadata)
-                };
-            });
-            return {
-                files: files,
-                directories: directories,
-                totalCount: totalCount,
-                directFileCount: directFileCount,
-                directFolderCount: directories.length,
-                returnedCount: files.length
-            };
-        });
-    });
+    var listed = {
+        files: files,
+        directories: directories,
+        totalCount: counts.totalCount,
+        directFileCount: counts.directFileCount,
+        directFolderCount: directories.length,
+        returnedCount: files.length
+    };
+    if (counts.countsUnavailable) {
+        listed.countsUnavailable = true;
+        if (Number(listed.totalCount) < listed.directFileCount) {
+            listed.totalCount = listed.directFileCount;
+        }
+    }
+    return listed;
 };
 
 // ==================== 设置操作 ====================
@@ -555,8 +590,40 @@ D1Database.prototype.list = function(options) {
     }
 };
 
-function escapeLikePattern(value) {
-    return String(value).replace(/[\\%_]/g, function(ch) { return '\\' + ch; });
+var LISTING_COUNT_TTL_MS = 20 * 1000;
+var CATALOG_PROBE_MORE_TTL_MS = 10 * 60 * 1000;
+var CATALOG_PROBE_FRESH_TTL_MS = 20 * 1000;
+var MAX_CHILD_DIRECTORIES = 500;
+var METADATA_ID_BATCH = 80;
+var listingCountCache = new WeakMap();
+var catalogProbeCache = new WeakMap();
+
+function cacheBucket(map, db) {
+    var bucket = map.get(db);
+    if (!bucket) {
+        bucket = new Map();
+        map.set(db, bucket);
+    }
+    return bucket;
+}
+
+function isDatabaseOverload(error) {
+    var message = String(error && error.message || error || '');
+    return /overloaded|too many resources/i.test(message);
+}
+
+// 目录前缀的开区间上界。'GalleryEpic/' -> 'GalleryEpic0'，'album/' -> 'album0'。
+// 'albumish/' 不会落进 album/ 的范围，'100X_done/' 也不会落进 '100%_done/'。
+function prefixUpperBound(prefix) {
+    var chars = Array.from(String(prefix));
+    for (var i = chars.length - 1; i >= 0; i--) {
+        var codePoint = chars[i].codePointAt(0);
+        if (codePoint < 0x10FFFF) {
+            chars[i] = String.fromCodePoint(codePoint + 1);
+            return chars.slice(0, i + 1).join('');
+        }
+    }
+    return String(prefix) + '\uffff';
 }
 
 function normalizeListingDirectory(directory) {
@@ -579,17 +646,24 @@ function listingFilter(extraSql, extraParams, search) {
 }
 
 function buildChildDirectoryQuery(directory, search) {
+    if (search) {
+        return buildChildDirectoryScan(directory, search);
+    }
+    return buildChildDirectorySkipScan(directory || '');
+}
+
+// 搜索要知道子目录里有没有命中，只能看文件名。浏览路径用下面的跳查。
+function buildChildDirectoryScan(directory, search) {
     var selectParams = [];
     var childExpr;
     var where = ["timestamp IS NOT NULL", "id NOT GLOB 'chunk_*'"];
     var whereParams = [];
 
     if (directory) {
-        // 直接子目录：去掉当前前缀后的第一段，结果不带结尾斜杠（与索引列表一致）
         childExpr = "substr(directory, 1, ? + instr(substr(directory, ?), '/') - 1)";
         selectParams.push(directory.length, directory.length + 1);
-        where.push("directory LIKE ? ESCAPE '\\'");
-        whereParams.push(escapeLikePattern(directory) + '%');
+        where.push("directory >= ? AND directory < ?");
+        whereParams.push(directory, prefixUpperBound(directory));
         where.push("instr(substr(directory, ?), '/') > 0");
         whereParams.push(directory.length + 1);
     } else {
@@ -597,11 +671,9 @@ function buildChildDirectoryQuery(directory, search) {
         where.push("directory IS NOT NULL AND instr(directory, '/') > 0");
     }
 
-    if (search) {
-        where.push("(instr(lower(id), ?) > 0 OR instr(lower(ifnull(file_name, '')), ?) > 0)");
-        var needle = String(search).toLowerCase();
-        whereParams.push(needle, needle);
-    }
+    where.push("(instr(lower(id), ?) > 0 OR instr(lower(ifnull(file_name, '')), ?) > 0)");
+    var needle = String(search).toLowerCase();
+    whereParams.push(needle, needle);
 
     return {
         sql: 'SELECT DISTINCT ' + childExpr + ' AS child FROM files WHERE ' + where.join(' AND ') + ' ORDER BY child',
@@ -609,24 +681,53 @@ function buildChildDirectoryQuery(directory, search) {
     };
 }
 
+// 按 directory 索引跳到下一个直接子目录，不读取该目录下的每一个文件。
+// 子目录名不带结尾斜杠，和原来的索引列表一致。递归层数封顶，避免表达式写错时死循环。
+function buildChildDirectorySkipScan(prefix) {
+    var params = [];
+    var placeholder = function(value) {
+        params.push(value);
+        return '?';
+    };
+    var upper = prefix ? prefixUpperBound(prefix) : '';
+    var childSlash = function() {
+        return 'substr(walk.dir, 1, length(' + placeholder(prefix) + ') + instr(substr(walk.dir, length(' + placeholder(prefix) + ') + 1), \'/\'))';
+    };
+    var successor = function() {
+        var full = childSlash();
+        var lengthOf = childSlash();
+        var lastChar = childSlash();
+        return 'substr(' + full + ', 1, length(' + lengthOf + ') - 1) || char(unicode(substr(' + lastChar + ', -1, 1)) + 1)';
+    };
+
+    var sql = 'WITH RECURSIVE walk(dir, n) AS (' +
+        'SELECT directory, 1 FROM (' +
+        'SELECT directory FROM files WHERE timestamp IS NOT NULL AND id NOT GLOB \'chunk_*\' ' +
+        'AND directory > ' + placeholder(prefix) + ' ' +
+        'AND (' + placeholder(upper) + ' = \'\' OR directory < ' + placeholder(upper) + ') ' +
+        'AND instr(substr(directory, length(' + placeholder(prefix) + ') + 1), \'/\') > 0 ' +
+        'ORDER BY directory LIMIT 1) ' +
+        'UNION ALL SELECT (' +
+        'SELECT f.directory FROM files f WHERE f.timestamp IS NOT NULL AND f.id NOT GLOB \'chunk_*\' ' +
+        'AND f.directory >= (' + successor() + ') ' +
+        'AND (' + placeholder(upper) + ' = \'\' OR f.directory < ' + placeholder(upper) + ') ' +
+        'AND instr(substr(f.directory, length(' + placeholder(prefix) + ') + 1), \'/\') > 0 ' +
+        'ORDER BY f.directory LIMIT 1), walk.n + 1 FROM walk ' +
+        'WHERE walk.dir IS NOT NULL AND walk.n < ' + MAX_CHILD_DIRECTORIES +
+        ') SELECT substr(dir, 1, length(' + placeholder(prefix) + ') + instr(substr(dir, length(' + placeholder(prefix) + ') + 1), \'/\') - 1) AS child FROM walk WHERE dir IS NOT NULL';
+    return { sql: sql, params: params };
+}
+
 function buildDirectoryFileQuery(directory, search, recursive, unlimited, limit, start) {
     var filter;
     var sql;
 
-    if (!recursive && !directory) {
-        // 两段等值查找才能用 idx_files_directory。OR 会让根目录分页退化为整表扫描。
-        var nullRows = listingFilter('directory IS NULL', [], search);
-        var emptyRows = listingFilter("directory = ''", [], search);
-        sql = 'SELECT id, metadata FROM (' +
-            'SELECT id, metadata, timestamp FROM files WHERE ' + nullRows.sql +
-            ' UNION ALL SELECT id, metadata, timestamp FROM files WHERE ' + emptyRows.sql +
-            ') ORDER BY timestamp DESC, id ASC';
-        filter = { params: nullRows.params.concat(emptyRows.params) };
-    } else if (!recursive) {
+    if (!recursive && directory) {
         filter = listingFilter('directory = ?', [directory], search);
         sql = 'SELECT id, metadata FROM files WHERE ' + filter.sql + ' ORDER BY timestamp DESC, id ASC';
     } else if (directory) {
-        filter = listingFilter("directory LIKE ? ESCAPE '\\'", [escapeLikePattern(directory) + '%'], search);
+        // 递归列出整个前缀。排序键不是索引前缀，大目录仍可能临时排序；管理端网格默认不走这里。
+        filter = listingFilter('directory >= ? AND directory < ?', [directory, prefixUpperBound(directory)], search);
         sql = 'SELECT id, metadata FROM files WHERE ' + filter.sql + ' ORDER BY timestamp DESC, id ASC';
     } else {
         filter = listingFilter('1 = 1', [], search);
@@ -641,12 +742,193 @@ function buildDirectoryFileQuery(directory, search, recursive, unlimited, limit,
     return { sql: sql, params: params };
 }
 
+async function listDirectoryFiles(db, directory, search, recursive, unlimited, limit, start) {
+    if (!recursive && !directory) {
+        return listRootFiles(db, search, unlimited, limit, start);
+    }
+    var query = buildDirectoryFileQuery(directory, search, recursive, unlimited, limit, start);
+    var result = await runStatement(db, query);
+    return (result.results || []).map(function(row) {
+        return { id: row.id, metadata: parseMetadata(row.metadata) };
+    });
+}
+
+// 根目录是 directory IS NULL 加上历史上的空字符串。OR 不能用目录索引，所以分成两段再合并。
+// 每一段只取前 start+limit 行：全局前 K 名一定来自各段自己的前 K 名。
+async function listRootFiles(db, search, unlimited, limit, start) {
+    var window = unlimited ? null : start + limit;
+    var branches = [
+        listingFilter('directory IS NULL', [], search),
+        listingFilter("directory = ''", [], search)
+    ];
+    var parts = await Promise.all(branches.map(function(filter) {
+        var sql = 'SELECT id, timestamp FROM files WHERE ' + filter.sql + ' ORDER BY timestamp DESC, id ASC';
+        var params = filter.params.slice();
+        if (window != null) {
+            sql += ' LIMIT ?';
+            params.push(window);
+        }
+        return runStatement(db, { sql: sql, params: params });
+    }));
+    var merged = [];
+    parts.forEach(function(part) {
+        (part.results || []).forEach(function(row) { merged.push(row); });
+    });
+    merged.sort(function(a, b) {
+        var delta = (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0);
+        if (delta !== 0) return delta;
+        if (a.id < b.id) return -1;
+        if (a.id > b.id) return 1;
+        return 0;
+    });
+    var page = unlimited ? merged : merged.slice(start, start + limit);
+    return loadFilesByIds(db, page.map(function(row) { return row.id; }));
+}
+
+async function loadFilesByIds(db, ids) {
+    if (!ids.length) return [];
+    var rows = [];
+    for (var i = 0; i < ids.length; i += METADATA_ID_BATCH) {
+        var slice = ids.slice(i, i + METADATA_ID_BATCH);
+        var marks = slice.map(function() { return '?'; }).join(',');
+        var result = await runStatement(db, {
+            sql: 'SELECT id, metadata FROM files WHERE id IN (' + marks + ')',
+            params: slice
+        });
+        rows = rows.concat(result.results || []);
+    }
+    var byId = new Map();
+    rows.forEach(function(row) { byId.set(row.id, row); });
+    return ids.filter(function(id) { return byId.has(id); }).map(function(id) {
+        var row = byId.get(id);
+        return { id: row.id, metadata: parseMetadata(row.metadata) };
+    });
+}
+
+async function listChildDirectories(db, directory, search) {
+    var result = await runStatement(db, buildChildDirectoryQuery(directory, search));
+    var seen = new Set();
+    var names = [];
+    (result.results || []).forEach(function(row) {
+        if (!row.child || seen.has(row.child)) return;
+        seen.add(row.child);
+        names.push(row.child);
+    });
+    names.sort();
+    return names;
+}
+
+async function readListingCounts(db, directory, search) {
+    var cacheKey = directory + '\0' + (search || '');
+    var bucket = cacheBucket(listingCountCache, db);
+    var cached = bucket.get(cacheKey);
+    if (cached && Date.now() <= cached.expires) {
+        return { totalCount: cached.totalCount, directFileCount: cached.directFileCount };
+    }
+    var counts = await computeListingCounts(db, directory, search);
+    if (!counts.countsUnavailable) {
+        bucket.set(cacheKey, {
+            totalCount: counts.totalCount,
+            directFileCount: counts.directFileCount,
+            expires: Date.now() + LISTING_COUNT_TTL_MS
+        });
+    }
+    return counts;
+}
+
+async function computeListingCounts(db, directory, search) {
+    if (!directory && !search) {
+        var directRow = await firstRow(db, {
+            sql: "SELECT " +
+                "(SELECT COUNT(*) FROM files WHERE directory IS NULL AND timestamp IS NOT NULL AND id NOT GLOB 'chunk_*') + " +
+                "(SELECT COUNT(*) FROM files WHERE directory = '' AND timestamp IS NOT NULL AND id NOT GLOB 'chunk_*') AS directFileCount",
+            params: []
+        });
+        var directFileCount = Number(directRow && directRow.directFileCount) || 0;
+        try {
+            var totalRow = await firstRow(db, {
+                sql: "SELECT COUNT(*) AS totalCount FROM files WHERE timestamp IS NOT NULL AND id NOT GLOB 'chunk_*'",
+                params: []
+            });
+            return {
+                totalCount: Number(totalRow && totalRow.totalCount) || 0,
+                directFileCount: directFileCount
+            };
+        } catch (error) {
+            if (!isDatabaseOverload(error)) throw error;
+            return {
+                totalCount: directFileCount,
+                directFileCount: directFileCount,
+                countsUnavailable: true
+            };
+        }
+    }
+
+    if (!directory) {
+        var scope = listingFilter('1 = 1', [], search);
+        var directScope = listingFilter("(directory IS NULL OR directory = '')", [], search);
+        var searched = await firstRow(db, {
+            sql: 'SELECT COUNT(*) AS totalCount FROM files WHERE ' + scope.sql,
+            params: scope.params
+        });
+        var searchedDirect = await firstRow(db, {
+            sql: 'SELECT COUNT(*) AS directFileCount FROM files WHERE ' + directScope.sql,
+            params: directScope.params
+        });
+        return {
+            totalCount: Number(searched && searched.totalCount) || 0,
+            directFileCount: Number(searchedDirect && searchedDirect.directFileCount) || 0
+        };
+    }
+
+    var upper = prefixUpperBound(directory);
+    if (!search) {
+        var ranged = await firstRow(db, {
+            sql: "SELECT COUNT(*) AS totalCount, COALESCE(SUM(CASE WHEN directory = ? THEN 1 ELSE 0 END), 0) AS directFileCount " +
+                "FROM files WHERE timestamp IS NOT NULL AND id NOT GLOB 'chunk_*' AND directory >= ? AND directory < ?",
+            params: [directory, directory, upper]
+        });
+        return {
+            totalCount: Number(ranged && ranged.totalCount) || 0,
+            directFileCount: Number(ranged && ranged.directFileCount) || 0
+        };
+    }
+
+    var filtered = listingFilter('directory >= ? AND directory < ?', [directory, upper], search);
+    var filteredRow = await firstRow(db, {
+        sql: 'SELECT COUNT(*) AS totalCount, COALESCE(SUM(CASE WHEN directory = ? THEN 1 ELSE 0 END), 0) AS directFileCount FROM files WHERE ' + filtered.sql,
+        params: [directory].concat(filtered.params)
+    });
+    return {
+        totalCount: Number(filteredRow && filteredRow.totalCount) || 0,
+        directFileCount: Number(filteredRow && filteredRow.directFileCount) || 0
+    };
+}
+
+function lowerBoundCounts(files, start, limit, unlimited) {
+    var pageFull = !unlimited && limit > 0 && files.length >= limit;
+    var directFileCount = start + files.length + (pageFull ? 1 : 0);
+    return {
+        totalCount: directFileCount,
+        directFileCount: directFileCount,
+        countsUnavailable: true
+    };
+}
+
 function runStatement(db, query) {
     var stmt = db.prepare(query.sql);
     if (query.params.length > 0) {
         stmt = stmt.bind.apply(stmt, query.params);
     }
     return stmt.all();
+}
+
+function firstRow(db, query) {
+    var stmt = db.prepare(query.sql);
+    if (query.params.length > 0) {
+        stmt = stmt.bind.apply(stmt, query.params);
+    }
+    return stmt.first();
 }
 
 function parseMetadata(value) {

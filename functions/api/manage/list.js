@@ -1,6 +1,6 @@
 import {
     readIndex, mergeOperationsToIndex, deleteAllOperations, rebuildIndex,
-    getIndexInfo, getIndexStorageStats
+    getIndexInfo, getIndexStorageStats, getIndexMeta, MAX_IN_MEMORY_INDEX_FILES
 } from '../../utils/indexManager.js';
 import { getDatabase } from '../../utils/databaseAdapter.js';
 import { createMetadataViewContext, serializeFileRecordForManagement } from '../../utils/metadata/metadataView.js';
@@ -121,19 +121,23 @@ export async function onRequest(context) {
 
         // 普通查询：只返回总数
         if (count === -1 && sum) {
-            const result = await readIndex(context, {
-                search,
-                directory: dir,
-                channel: channelArray,
-                listType: listTypeArray,
-                accessStatus: accessStatusArray,
-                label: labelArray,
-                fileType: fileTypeArray,
-                channelName: channelNameArray,
-                includeTags: includeTagsArray,
-                excludeTags: excludeTagsArray,
-                countOnly: true
-            });
+            // 分块索引盖不住整张表时不要先去合并它。合并会读全部分块，还可能在上传中改写分块。
+            let result = { success: false };
+            if (await memoryIndexCoversListing(context)) {
+                result = await readIndex(context, {
+                    search,
+                    directory: dir,
+                    channel: channelArray,
+                    listType: listTypeArray,
+                    accessStatus: accessStatusArray,
+                    label: labelArray,
+                    fileType: fileTypeArray,
+                    channelName: channelNameArray,
+                    includeTags: includeTagsArray,
+                    excludeTags: excludeTagsArray,
+                    countOnly: true
+                });
+            }
 
             // countOnly 成功时没有 success 字段；只有读取失败才是 success === false
             const total = result.success === false
@@ -148,22 +152,25 @@ export async function onRequest(context) {
             });
         }
 
-        // 普通查询：返回数据
-        const result = await readIndex(context, {
-            search,
-            directory: dir,
-            start,
-            count,
-            channel: channelArray,
-            listType: listTypeArray,
-            accessStatus: accessStatusArray,
-            label: labelArray,
-            fileType: fileTypeArray,
-            channelName: channelNameArray,
-            includeTags: includeTagsArray,
-            excludeTags: excludeTagsArray,
-            includeSubdirFiles: recursive,
-        });
+        // 普通查询：返回数据。目录行数已经超过分块索引时直接查 D1，避免把过期的小索引当成全库。
+        let result = { success: false };
+        if (await memoryIndexCoversListing(context)) {
+            result = await readIndex(context, {
+                search,
+                directory: dir,
+                start,
+                count,
+                channel: channelArray,
+                listType: listTypeArray,
+                accessStatus: accessStatusArray,
+                label: labelArray,
+                fileType: fileTypeArray,
+                channelName: channelNameArray,
+                includeTags: includeTagsArray,
+                excludeTags: excludeTagsArray,
+                includeSubdirFiles: recursive,
+            });
+        }
 
         // 索引不可用时按目录直接查询，只取当前页
         if (!result.success) {
@@ -175,7 +182,7 @@ export async function onRequest(context) {
                 search,
             });
 
-            return new Response(JSON.stringify({
+            const body = {
                 files: dbRecords.files,
                 directories: dbRecords.directories,
                 totalCount: dbRecords.totalCount,
@@ -184,7 +191,13 @@ export async function onRequest(context) {
                 returnedCount: dbRecords.returnedCount,
                 indexLastUpdated: Date.now(),
                 isIndexedResponse: false // 标记这是未走索引的响应
-            }), {
+            };
+            // 计数被 D1 拒绝时仍返回这一页。数字只是下界，不能当成全库总数。
+            if (dbRecords.countsUnavailable) {
+                body.countsUnavailable = true;
+            }
+
+            return new Response(JSON.stringify(body), {
                 headers: { "Content-Type": "application/json", ...corsHeaders }
             });
         }
@@ -220,6 +233,25 @@ export async function onRequest(context) {
             headers: { "Content-Type": "application/json", ...corsHeaders }
         });
     }
+}
+
+// KV 没有 SQL 目录列，继续用内存索引。
+// D1 上，分块 meta 缺失、声称的文件数超过内存上限，或 files 里已经有比 meta 更多的可列表行时，
+// 分块索引不能代表目录。这时去读、合并分块只会在上传进行时反复改写过期索引。
+async function memoryIndexCoversListing(context) {
+    const db = getDatabase(context.env);
+    if (!db || typeof db.catalogHasMoreThan !== 'function') {
+        return true;
+    }
+    const meta = await getIndexMeta(context);
+    if (!meta || meta.success === false) {
+        return false;
+    }
+    if ((Number(meta.totalCount) || 0) > MAX_IN_MEMORY_INDEX_FILES) {
+        return false;
+    }
+    const catalogExceeded = await db.catalogHasMoreThan(meta.totalCount || 0);
+    return !catalogExceeded;
 }
 
 async function countFilesWithoutIndex(context, { dir, search }) {
