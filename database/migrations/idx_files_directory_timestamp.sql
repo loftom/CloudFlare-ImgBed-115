@@ -1,0 +1,57 @@
+-- Admin directory pages at million-row scale.
+--
+-- The files table already has idx_files_directory (directory). A page sorted by
+-- timestamp then uses a temporary b-tree and reads every metadata blob in that
+-- folder. Under ongoing uploads that scan is what makes large directories fail
+-- with "D1 DB is overloaded" while a small root page can still succeed.
+--
+-- This index lets a non-recursive page stop after LIMIT rows:
+--   SEARCH files USING INDEX idx_files_directory_timestamp
+--     (directory=? AND timestamp>?)
+-- Prefix counts use the same index:
+--   directory >= ? AND directory < ?
+-- idx_files_directory is unchanged. Chunk size is unchanged. This is not a
+-- rebuild of manage@index_* and it does not rewrite file rows.
+--
+-- Apply (operator, against the production D1 database; not part of app deploy):
+--   npx wrangler d1 execute <database> --remote --file=database/migrations/idx_files_directory_timestamp.sql
+-- CREATE INDEX IF NOT EXISTS is safe to retry. Building it on about a million
+-- rows competes with uploads and can hit D1's time limit; a failed statement
+-- rolls back, leaving the previous schema. Retry when the database is quieter.
+-- Do not pause ingestion for this index unless you have decided to. Any pause
+-- is a separate approval and is not required by this statement.
+-- Do not run /api/manage/list?action=rebuild for this. The in-memory chunk
+-- index cannot represent a million files.
+--
+-- Code can be deployed before or after this statement. Before the index
+-- exists, listing stays correct and uses idx_files_directory, but a large
+-- folder can still overload D1. The fast page plan needs this index.
+--
+-- Validate after it exists:
+--   EXPLAIN QUERY PLAN
+--   SELECT id, metadata FROM files
+--   WHERE timestamp IS NOT NULL AND id NOT GLOB 'chunk_*' AND directory = 'GalleryEpic/'
+--   ORDER BY timestamp DESC, id ASC
+--   LIMIT 10;
+--   The plan should search idx_files_directory_timestamp and should not say
+--   USE TEMP B-TREE FOR ORDER BY.
+--   Then GET /api/manage/list?count=10&dir=GalleryEpic/ should return 200 with
+--   one page of files. isIndexedResponse stays false while the chunk index
+--   covers only a fraction of the table. That is expected.
+--
+-- Rollback:
+--   DROP INDEX IF EXISTS idx_files_directory_timestamp;
+--   Pages can also roll back to the previous deployment. Either one is enough
+--   to restore the previous (slower, still correct) queries. Do not drop
+--   idx_files_directory.
+--
+-- Limits that remain after this index:
+--   Search, recursive=true, and count=-1 can still walk a whole folder.
+--   count=-1 is what folder delete/move/copy uses, so it is not capped.
+--   Immediate child names are a skip-scan, capped at 500 names.
+--   Exact counts are cached for about 20 seconds per isolate.
+--   If a count is refused because D1 is overloaded, the page is still returned
+--   and countsUnavailable is true; those numbers are only a lower bound.
+
+CREATE INDEX IF NOT EXISTS idx_files_directory_timestamp
+    ON files(directory, timestamp DESC, id);

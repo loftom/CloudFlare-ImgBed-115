@@ -75,6 +75,11 @@ CREATE TABLE IF NOT EXISTS other_data (
 
 CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_files_directory ON files(directory);
+-- 管理端目录页按 (directory, timestamp) 取一页。只有 directory 索引时，
+-- ORDER BY timestamp 会把该目录每一行的 metadata 放进临时排序。
+-- 已有库不要靠本文件补索引，执行 database/migrations/idx_files_directory_timestamp.sql。
+-- 保留 idx_files_directory。不要改分块大小，也不要靠重建内存索引来代替这个索引。
+CREATE INDEX IF NOT EXISTS idx_files_directory_timestamp ON files(directory, timestamp DESC, id);
 CREATE INDEX IF NOT EXISTS idx_files_channel ON files(channel);
 CREATE INDEX IF NOT EXISTS idx_files_file_type ON files(file_type);
 CREATE INDEX IF NOT EXISTS idx_files_upload_ip ON files(upload_ip);
