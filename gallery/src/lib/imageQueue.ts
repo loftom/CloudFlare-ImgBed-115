@@ -6,6 +6,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
  * - high：视口内；low：视口附近的预热。high 永远先于 low 出队。
  * - 卸载/离开时撤下 <img src>，浏览器才会真正中断请求并归还槽位。
  * - 单个请求停滞超过 STALL_TIMEOUT_MS 视为失败，释放槽位，避免整站卡死。
+ *   计时从拿到并发槽、真正发出请求时开始；还在排队时不计时，超时后也不会把这次预算作废。
  */
 export type Priority = 'high' | 'low';
 
@@ -21,6 +22,8 @@ interface Task {
   started: boolean;
   done: boolean;
   start: () => void;
+  /** 只在任务拿到并发槽、请求真正发出后才存在。排队期间没有计时器。 */
+  stallTimer?: number;
 }
 
 export function setMaxConcurrent(n: number) {
@@ -54,8 +57,30 @@ function pump() {
   }
 }
 
+function clearStall(task: Task) {
+  if (task.stallTimer !== undefined) {
+    window.clearTimeout(task.stallTimer);
+    task.stallTimer = undefined;
+  }
+}
+
+/**
+ * 停滞计时从「已经占住并发槽」开始，而不是从入队开始。
+ * 排队时就开始倒计时的话，等轮到它时预算已经耗尽，回调看到 !started 会直接返回且不会再武装，
+ * 之后挂住的请求就一直占着槽位。
+ */
+function armInFlightStall(task: Task, onStall: () => void) {
+  clearStall(task);
+  task.stallTimer = window.setTimeout(() => {
+    task.stallTimer = undefined;
+    if (!task.started || task.done) return;
+    onStall();
+  }, STALL_TIMEOUT_MS);
+}
+
 function finish(task: Task | null, ok: boolean) {
   if (!task || task.done) return;
+  clearStall(task);
   task.done = true;
   if (ok) loaded.add(task.url);
   if (task.started) {
@@ -118,24 +143,24 @@ export function useQueuedImage(url: string | undefined, enabled: boolean, priori
       priority: priorityRef.current,
       started: false,
       done: false,
-      start: () => {
-        setSrc(url);
-        setState('loading');
-      },
+      start: () => {},
+    };
+    task.start = () => {
+      setSrc(url);
+      setState('loading');
+      // pump() 会先把 started 设为 true 再调用 start，此时才开始 30s 停滞计时。
+      armInFlightStall(task, () => {
+        finish(task, false);
+        setSrc(undefined);
+        setState('error');
+      });
     };
     taskRef.current = task;
     queues[task.priority].push(task);
     pump();
 
-    const timer = window.setTimeout(() => {
-      if (task.done || !task.started) return;
-      finish(task, false);
-      setSrc(undefined);
-      setState('error');
-    }, STALL_TIMEOUT_MS);
-
     return () => {
-      window.clearTimeout(timer);
+      clearStall(task);
       if (taskRef.current === task) taskRef.current = null;
       if (!task.done) {
         const wasStarted = task.started;

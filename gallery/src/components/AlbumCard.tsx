@@ -18,6 +18,7 @@ export const AlbumCard = React.memo(function AlbumCard({ dir, imageBase }: { dir
   useEffect(() => {
     if (!near || info || failed) return;
     let alive = true;
+    // 封面失败只影响这一张卡片：占位，不把错误抛到目录页。
     fetchCover(dir.path).then(
       (r) => alive && setInfo(r),
       () => alive && setFailed(true),

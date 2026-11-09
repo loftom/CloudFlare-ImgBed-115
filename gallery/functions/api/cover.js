@@ -35,7 +35,7 @@ export async function onRequestGet(context) {
         childCount: first?.directories.length ?? 0,
       },
       200,
-      { 'Cache-Control': 'private, max-age=300' },
+      { 'Cache-Control': 'private, max-age=86400' },
     );
   } catch (err) {
     return errorResponse(err);

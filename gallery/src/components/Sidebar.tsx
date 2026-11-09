@@ -24,13 +24,20 @@ export function Sidebar({ currentDir, open, onClose, configError }: Props) {
       setStatus('error');
       return;
     }
-    fetchList({ dir: '', start: 0, count: 1, order: 'desc' }).then(
+    const ac = new AbortController();
+    setStatus('loading');
+    fetchList({ dir: '', start: 0, count: 1, order: 'desc' }, ac.signal).then(
       (r) => {
+        if (ac.signal.aborted) return;
         setRoots(r.directories);
         setStatus('ok');
       },
-      () => setStatus('error'),
+      () => {
+        if (ac.signal.aborted) return;
+        setStatus('error');
+      },
     );
+    return () => ac.abort();
   }, [configError]);
 
   useEffect(() => {

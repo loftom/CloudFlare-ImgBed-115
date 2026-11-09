@@ -29,6 +29,7 @@ try {
 
   let r = await call(listGet, '/api/list?dir=');
   assert.equal(r.status, 200);
+  assert.equal(r.res.headers.get('cache-control'), 'private, max-age=300, stale-while-revalidate=600');
   assert.deepEqual(r.body.directories.map((d) => d.path), ['BBB', 'GE', 'HC']);
   ok('根目录列出 BBB / GE / HC');
 
@@ -52,6 +53,7 @@ try {
 
   r = await call(listGet, '/api/list?dir=GE/../HC');
   assert.equal(r.status, 400);
+  assert.match(r.res.headers.get('cache-control') || '', /no-store/);
   r = await call(listGet, '/api/list?dir=GE&count=99999');
   assert.equal(r.body.count, 200);
   ok('拒绝路径穿越，count 上限 200');
@@ -65,10 +67,12 @@ try {
   r = await call(listGet, '/api/list?dir=GE', { ...env, IMGBED_LIST_TOKEN: 'wrong' });
   assert.equal(r.status, 502);
   assert.match(r.body.error, /list/);
+  assert.match(r.res.headers.get('cache-control') || '', /no-store/);
   ok('Token 错误时返回 502 + 中文提示');
 
   r = await call(coverGet, '/api/cover?dir=BBB');
   assert.equal(r.status, 200);
+  assert.equal(r.res.headers.get('cache-control'), 'private, max-age=86400');
   assert.ok(r.body.cover && r.body.cover.path.startsWith('BBB/'));
   assert.equal(r.body.childCount, 6);
   ok('无直接图片的目录会沿第一个子目录找封面');
