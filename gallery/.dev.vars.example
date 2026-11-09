@@ -1,0 +1,8 @@
+# 复制为 .dev.vars 后供 `npx wrangler pages dev dist` 本地联调真实 ImgBed 使用（.dev.vars 已在 .gitignore）
+IMGBED_ORIGIN=https://loftom-imgbed.pages.dev
+IMGBED_LIST_TOKEN=imgbed_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# ALLOWED_DIRS=GE,HC,BBB
+# IMAGE_PROXY=false
+# CF_ACCESS_TEAM_DOMAIN=yourteam.cloudflareaccess.com
+# CF_ACCESS_AUD=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# CF_ACCESS_ALLOWED_EMAILS=you@example.com
