@@ -1,0 +1,31 @@
+{
+  "name": "loftom-gallery",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "私人图库前端：读 ImgBed 目录索引，Cloudflare Pages + Functions 部署",
+  "scripts": {
+    "dev": "vite --mode mock --host 127.0.0.1 --port 5173",
+    "dev:mock": "vite --mode mock --host 127.0.0.1 --port 5173",
+    "build": "tsc --noEmit && vite build && node scripts/check-bundle.mjs",
+    "preview": "vite preview --host 127.0.0.1 --port 4173",
+    "test:functions": "node scripts/test-functions.mjs"
+  },
+  "dependencies": {
+    "lucide-react": "^0.395.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.19",
+    "postcss": "^8.4.38",
+    "tailwindcss": "^3.4.4",
+    "typescript": "^5.4.5",
+    "vite": "^5.3.1"
+  }
+}
