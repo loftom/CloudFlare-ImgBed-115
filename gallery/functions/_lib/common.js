@@ -1,5 +1,19 @@
 // 公共工具：环境变量解析、目录参数清洗、调用 ImgBed 列表接口。
 // 这里的代码只在 Cloudflare Pages Functions（服务端）运行，不会进入浏览器 bundle。
+// 上游偶发 5xx / 429 / D1 过载时会退避重试；成功的列表 JSON 写入 caches.default。
+// 缓存读取发生在 Access 校验之后（见 api/_middleware.js），缓存键不含任何凭证。
+
+import {
+  UPSTREAM_CACHE_SECONDS,
+  bodyMentionsSecret,
+  buildUpstreamListUrl,
+  createCacheRequest,
+  fetchWithRetry,
+  isCacheableListBody,
+  readCachedJson,
+  resolveCache,
+  writeCachedJson,
+} from './upstreamRetry.js';
 
 export const MAX_PAGE_SIZE = 200;
 export const DEFAULT_PAGE_SIZE = 60;
@@ -136,27 +150,66 @@ function shapeDirectories(list, parent) {
   return out;
 }
 
+function normalizeUpstreamQuery(query) {
+  return {
+    dir: sanitizePath(query?.dir ?? ''),
+    start: parseIntParam(query?.start, 0, 0, 10_000_000),
+    count: parseIntParam(query?.count, DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE),
+  };
+}
+
+function shapeUpstreamList(body, dir) {
+  return {
+    files: (Array.isArray(body.files) ? body.files : []).map(shapeFile),
+    directories: shapeDirectories(body.directories, dir),
+    directFileCount: Number(body.directFileCount) || 0,
+    totalCount: Number(body.totalCount) || 0,
+    countsUnavailable: body.countsUnavailable === true,
+  };
+}
+
 /**
  * 调 ImgBed GET /api/manage/list。只转发 dir/start/count 三个参数，绝不转发 action/search 等，
  * 因此即便 Token 有 list 权限，也触发不了 action=rebuild 之类的索引操作。
  * 鉴权：Authorization: Bearer <token>，Token 需要 "list" 权限
  * （见 ImgBed functions/api/manage/_middleware.js 与 functions/utils/auth/tokenValidator.js）。
+ *
+ * 5xx、429、网络错误，以及正文含 "D1 DB is overloaded" 的非 4xx 响应会自动重试
+ * （默认 3 次，约 300ms / 800ms / 1.6s，带抖动）。401/403/其它 4xx 不重试。
+ * 成功的上游 JSON 写入 Cache API 约 5 分钟。键是规范化后的上游 URL，不带 Authorization / Cookie。
+ * 调用方必须先完成 Access 校验（/api 与 /file 的 _middleware.js），未通过的请求到不了这里。
+ *
+ * hooks.sleep / hooks.random / hooks.fetch / hooks.cache 供单测注入。cache === null 时关闭缓存。
  */
-export async function upstreamList(env, { dir, start, count }, fetchImpl = fetch) {
+export async function upstreamList(env, query, fetchImpl = fetch, hooks = {}) {
   const origin = getOrigin(env);
   const token = getToken(env);
-  const url = new URL('/api/manage/list', origin);
-  url.searchParams.set('dir', dir);
-  url.searchParams.set('start', String(start));
-  url.searchParams.set('count', String(count));
+  const normalized = normalizeUpstreamQuery(query);
+  const url = buildUpstreamListUrl(origin, normalized);
+  const doFetch = typeof hooks.fetch === 'function' ? hooks.fetch : fetchImpl;
+  let cache = resolveCache(hooks.cache);
+  const cacheReq = cache ? createCacheRequest(url) : null;
+  if (cacheReq && token && cacheReq.url.includes(token)) cache = null;
+
+  if (cache && cacheReq) {
+    try {
+      const hit = await readCachedJson(cache, cacheReq);
+      if (hit) return shapeUpstreamList(hit, normalized.dir);
+    } catch {
+      // Cache API 不可用（例如 Access 前置的 Worker）时直接回源。
+    }
+  }
 
   let res;
   try {
-    res = await fetchImpl(url.toString(), {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-      redirect: 'manual',
-    });
+    res = await fetchWithRetry(
+      () => doFetch(url.toString(), {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+        redirect: 'manual',
+      }),
+      { sleep: hooks.sleep, random: hooks.random, maxRetries: hooks.maxRetries },
+    );
   } catch (e) {
     throw new HttpError(502, '无法连接 ImgBed：' + (e?.message || e));
   }
@@ -174,13 +227,14 @@ export async function upstreamList(env, { dir, start, count }, fetchImpl = fetch
   }
   if (body && body.error) throw new HttpError(502, 'ImgBed 错误：' + String(body.message || body.error));
 
-  return {
-    files: (Array.isArray(body.files) ? body.files : []).map(shapeFile),
-    directories: shapeDirectories(body.directories, dir),
-    directFileCount: Number(body.directFileCount) || 0,
-    totalCount: Number(body.totalCount) || 0,
-    countsUnavailable: body.countsUnavailable === true,
-  };
+  if (cache && cacheReq && isCacheableListBody(body) && !bodyMentionsSecret(body, token)) {
+    try {
+      await writeCachedJson(cache, cacheReq, body, UPSTREAM_CACHE_SECONDS);
+    } catch {
+      // 写入失败不影响本次已经拿到的列表。
+    }
+  }
+  return shapeUpstreamList(body, normalized.dir);
 }
 
 const collator = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });

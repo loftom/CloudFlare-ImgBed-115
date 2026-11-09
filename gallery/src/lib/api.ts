@@ -1,3 +1,4 @@
+import { ApiError, delay, runWithRetry, LIST_MAX_RETRIES } from './retry';
 import type { CoverResponse, GalleryConfig, ListResponse, Order } from './types';
 
 // 浏览器只访问同源 /api/*（Pages Functions）。Token 只存在于服务端环境变量中。
@@ -12,7 +13,7 @@ async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
   }
   if (!res.ok) {
     const msg = (body as { error?: string } | null)?.error || `请求失败（HTTP ${res.status}）`;
-    throw new Error(msg);
+    throw new ApiError(msg, res.status);
   }
   return body as T;
 }
@@ -39,11 +40,17 @@ export function fetchList(
     order: params.order,
   });
   if (params.total != null && params.order === 'asc') q.set('total', String(params.total));
-  return getJson<ListResponse>(`/api/list?${q}`, signal);
+  const url = `/api/list?${q}`;
+  // 整页失败前再试 2 次。取消（离开页面）不重试。
+  return runWithRetry(() => getJson<ListResponse>(url, signal), {
+    maxRetries: LIST_MAX_RETRIES,
+    sleep: (ms) => delay(ms, signal),
+  });
 }
 
 // ---- 封面请求：会话内缓存 + 并发上限（目录墙一次可能有几百张卡片） ----
-const COVER_CONCURRENCY = 4;
+/** 同时最多 2 个 /api/cover，其余排队。失败由卡片自己显示占位，不抛到页面。 */
+export const COVER_CONCURRENCY = 2;
 const coverCache = new Map<string, Promise<CoverResponse>>();
 let coverActive = 0;
 const coverQueue: Array<() => void> = [];

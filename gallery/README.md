@@ -49,6 +49,7 @@ gallery/
 
 - 浏览器 bundle 里 **没有** 管理员密码，也没有任何 Token。Token 只存在于 Pages 项目的加密环境变量 `IMGBED_LIST_TOKEN` 中，`npm run build` 会自动扫描 `dist/`，发现 `imgbed_…`、`IMGBED_LIST_TOKEN`、`/api/manage/`、`Bearer ` 等字符串就直接构建失败。
 - 代理只做「列目录」：上游路径写死为 `/api/manage/list`，只转发 `dir` / `start` / `count` 三个参数（**绝不转发 `action`、`search` 等**），所以拿不到 ImgBed 的重建索引之类操作。`dir` 会做清洗：去掉多余斜杠，拒绝 `.`/`..` 段、反斜杠、控制字符和超长输入；`count` 上限 200。
+- 上游偶发 5xx、429、网络错误，或正文出现 `D1 DB is overloaded` 时，Function 会按约 300ms / 800ms / 1.6s（带抖动）重试，最多 3 次；401/403 和其它 4xx 不重试。成功的上游列表 JSON 写入 Cache API（`caches.default`）约 5 分钟。缓存键只有规范化后的 `dir` / `start` / `count`，不含 Cookie、Access JWT 或上游 `Authorization`。Access 校验在读缓存之前完成，错误响应不缓存。返回给浏览器的 `/api/list` 是 `private, max-age=300, stale-while-revalidate=600`，`/api/cover` 是 `private, max-age=86400`。
 - 返回给浏览器的字段是白名单：`path / name / kind / ts / size / blocked`，ImgBed 元数据里的渠道、TG ChatId、上传 IP 等一律丢弃。
 - 可选 `ALLOWED_DIRS` 把可浏览范围限制在若干顶层目录。
 - 可选 Access JWT 校验：配置 `CF_ACCESS_TEAM_DOMAIN` + `CF_ACCESS_AUD` 后，`/api/*` 和 `/file/*` 会校验 `Cf-Access-Jwt-Assertion`（或 `CF_Authorization` Cookie）的 RS256 签名、`aud`、`exp`、`iss`，可再用 `CF_ACCESS_ALLOWED_EMAILS` 限定邮箱。Access 本来就在边缘拦截，这一层是纵深防御（防止有人绕过 Access 直接打 `*.pages.dev` 的预览域名等）。
@@ -144,14 +145,14 @@ npm run dev            # http://127.0.0.1:5173
 - `npm run dev` 会在 `127.0.0.1:18787` 起一个 mock ImgBed（实现了 `/api/manage/list` 的 Bearer Token 校验和 D1 的分页/排序语义，`/file/*` 返回本地生成的 SVG 占位图），并在 Vite 里按 Pages 约定执行 `functions/` 的 **真实代码**（中间件链、`onRequestGet`、`[[path]]` 参数）。
 - mock 数据：`GE`（18 套）、`HC`（12 套）、`BBB`（4 个合集 × 10 套，`超大合集/全集 1500P` 测分页，`海量套图` 240 个子目录测目录墙分批）。
 - 可调：`MOCK_DELAY=300 npm run dev`（模拟慢速网络）、`IMAGE_PROXY=true npm run dev`（测同源代理）、`ALLOWED_DIRS=GE,BBB npm run dev`。
-- `npm run test:functions`：Functions 自测（路径清洗、asc/desc 分页、ALLOWED_DIRS、Token 错误、封面查找、代理开关、Access JWT 的各种通过/拒绝情形）。
+- `npm test`：先跑 vitest（上游重试 / 缓存键 / 前端列表重试），再跑 `npm run test:functions`（路径清洗、asc/desc 分页、ALLOWED_DIRS、Token 错误、封面查找、代理开关、Access JWT 的各种通过/拒绝情形）。
 - 连真实 ImgBed 联调：`cp .dev.vars.example .dev.vars` 填好后 `npm run build && npx wrangler pages dev dist`（`.dev.vars` 已被 gitignore）。
 
 ## 已知限制
 
 - **排序**：ImgBed 只支持按上传时间倒序分页。「上传顺序」是用 `directFileCount` 反算窗口再倒序得到的，翻页时会把总数带回服务端以省一次请求；同一时间戳内按文件名自然排序（仅页内）。ImgBed 计数不可用（D1 过载，`countsUnavailable`）时会自动退回「最新在前」并提示。
 - **子目录上限 500**：ImgBed 的子目录查询上限是 500，超过的子目录不会出现。
-- **封面开销**：每张目录卡片的封面需要 1–2 次（无直接图片时最多 8 次）上游列表请求；有会话内缓存和浏览器 5 分钟缓存，卡片接近视口才请求，并发 4。
+- **封面开销**：每张目录卡片的封面需要 1–2 次（无直接图片时最多 8 次）上游列表请求。封面接近视口才请求，同时最多 2 个，失败只显示占位、不拖垮整页；浏览器缓存一天。列表在浏览器侧失败后再试 2 次。服务端对成功的上游列表另有约 5 分钟的 Cache API 缓存。
 - **原图做缩略图**：未开 CF Images 缩放，网格里加载的是原图，流量较大；并发队列和懒加载能保证首屏优先，但大目录快速滚动仍会比较耗流量。
 - 只显示图片；视频和其他文件只计数不展示。
 - 文件名里含 `%`、`,` 的路径在 ImgBed `/file` 侧本身就可能解析异常（它把路径段用逗号拼接后再 decode），图库不做额外处理。
